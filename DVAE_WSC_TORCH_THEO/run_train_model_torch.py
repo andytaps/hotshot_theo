@@ -11,6 +11,8 @@ from time import time
 import torch
 from torch import  optim
 from Classes import HDF5Dataset, DVAE, DistributedEvalSampler, DVAE_WSC
+import matplotlib
+from visuals import *
 import random
 import numpy as np
 #from torchsummary import summary
@@ -23,6 +25,7 @@ import subprocess
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import idr_torch
+import torch.multiprocessing as mp
 
 # Use the same seed for testing
 #torch.manual_seed(42)
@@ -30,18 +33,20 @@ import idr_torch
 #torch.backends.cudnn.benchmark = False
 #np.random.seed(42)
 
+torch.autograd.set_detect_anomaly(True)
 
-def setup():
-    #os.environ['MASTER_ADDR'] = 'localhost'
-    #os.environ['MASTER_PORT'] = '12355'
+def setup(PROCESS_RANK,WORLD_SIZE):
 
     # initialize the process group
-    dist.init_process_group("nccl", init_method='env://',rank=idr_torch.rank, world_size=idr_torch.size)
+    dist.init_process_group("nccl", init_method='env://',rank=PROCESS_RANK, world_size=WORLD_SIZE)
 
 def cleanup():
     dist.destroy_process_group()
 
-
+def set_backend(backend='agg'):
+    # since Jean-Zay doesn't support interactive backend, set to non-interactive 
+    # backend like 'agg'. For Hotshot: set back to 'qt5agg'
+    matplotlib.use(backend)
 
 
 """parsing and configuration"""
@@ -91,6 +96,13 @@ def parse_args():
 
     parser.add_argument('--resume_chkp', type=str, default=None,
                         help='Resume training from the specified checkpoint path.')
+    
+    parser.add_argument('--platform', type=str, default='hotshot', 
+                        choices=['laptop', 'hotshot', 'JZ'],
+                        help='Choose where to run training. Mostly controls how to dela with gpus. Need to modify ./idr_torch.py accordingly.')
+
+    parser.add_argument('--test_mode', type=str, default='BEST', choices=['BEST', 'LAST'],
+                        help='Use BEST (lower validation loss) or LAST model for predictions on test set.')
 
 
     return check_args(parser.parse_args())
@@ -130,26 +142,203 @@ def initialize_weights(m):
 
 # Reconstruction + KL divergence losses summed over all elements and batch
 # maybe improve this loss function to be more specific to our case? 
-def loss_function(recon_x, x, mu, logvar):
-    BCE = F.binary_cross_entropy(recon_x, x, reduction='sum')#/(128*72*320)
 
-    # see Appendix B from VAE paper:
-    # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
-    # https://arxiv.org/abs/1312.6114
-    # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-
-    return BCE, KLD
-
-
-def main(args):
+def smoothness(images, h_coeff, v_coeff):       # supposes (N,C,H,W) format for output
+    # if more smoothness wanted between stations then increase v_coeff
+    # if more smoothness wanted through time for each station then increase h_coeff
     
-    print("Running PEGSNET_DVAE (DDP) on rank {}.".format(idr_torch.rank))
+    # batch_n = images.shape[0]
+    # channel = images.shape[1]
+    height  = images.shape[2]
+    width   = images.shape[3]
+    
+    horizontal_normal = torch.narrow(images, dim=2, start=0, length=height-1)    # take first H-1 rows of tensor
+    horizontal_shift  = torch.narrow(images, dim=2, start=1, length=height-1)    # take last H-1 rows of tensor
+    
+    vertical_normal = torch.narrow(images, dim=3, start=0, length=width-1)       # take first W-1 columns of tensor
+    vertical_shift  = torch.narrow(images, dim=3, start=1, length=width-1)       # take last W-1 columns of tensor
+    
+    horizontal = torch.pow(horizontal_normal-horizontal_shift, 2)
+    vertical   = torch.pow(vertical_normal-vertical_shift, 2)
+    
+    h_loss = torch.mean(horizontal)
+    v_loss = torch.mean(vertical)
+    
+    return h_loss*h_coeff + v_loss*v_coeff
 
-    if idr_torch.rank==0:
-        print("ME, PROCESS {}, I am MASTER".format(idr_torch.rank))
+def loss_function(recon_x, x, mu, logvar,bceCoeff=1, kldCoeff=1, slCoeff=1):
+    # reconstruction loss:
+    recon_loss  = bceCoeff * F.binary_cross_entropy(recon_x, x, reduction='sum') # /(320*72) for avg over all batch images 
+    
+    # smoothness loss:
+    smooth_loss = slCoeff * smoothness(recon_x, h_coeff=1, v_coeff=2) # more important that signal be smooth through time (not space)
+        
+    # latent loss :
+    latent_loss = kldCoeff * (-0.5) * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-    setup()
+    # return BCE, KLD, SL
+    return recon_loss, latent_loss, smooth_loss
+
+
+def predict_test_set(Dmodel, modelname, db_name, shape, test_mode, distributed, WORLD_SIZE, LOCAL_RANK, PROCESS_RANK):
+
+    # Get indexes of test set
+    test_idx = np.loadtxt(modelname + '_test_idx.txt')
+    # Get total number of examples in the test set
+    numex = len(test_idx)
+    # Sort them (not needed)
+    test_idx = np.sort(test_idx)
+    # Get the indexes
+    test_indici = test_idx[:numex]
+    # Number of batch samples for each gpu
+    batch_size_per_gpu = 500
+    # LOAD THE RELEVANT MODEL
+    if test_mode == 'BEST':
+
+        MODELPATH = modelname + "_BEST"
+
+    elif test_mode == 'LAST':
+
+        MODELPATH = modelname 
+
+    gpu = torch.device("cuda")
+
+    if distributed:
+
+        ################### NOW LOAD IT EVERYWHERE
+        #Synchronize on all gpus
+        dist.barrier()
+        map_location = {'cuda:%d' % 0: 'cuda:%d' % LOCAL_RANK} 
+        checkpoint = torch.load(MODELPATH+"_DDP.pth", map_location=map_location)
+        Dmodel.load_state_dict(checkpoint) # load model
+        # Each process (GPU) will save tot_samples/4 examples. So divide the lenght of test set by four
+        samp_per_gpu = int(len(test_indici)/WORLD_SIZE)
+
+
+    else:
+        checkpoint = torch.load(MODELPATH + ".pth")
+        Dmodel.load_state_dict(checkpoint) # load last model
+        samp_per_gpu = len(test_indici)
+
+    Dmodel.eval() 
+
+    ############ DEFINE TEST LOADER
+    # Parameters
+    if distributed:
+        params = {'batch_size': batch_size_per_gpu,
+                  'shuffle': False,
+                  'num_workers': 40,
+                  'pin_memory':True}
+    else:
+        params = {'batch_size': batch_size_per_gpu,
+          'shuffle': True,
+          'num_workers': 16,
+          'pin_memory':True}
+
+    # Shape is a tuple with n_stations, t_max, ncomp
+    # For each time step make predictions on a batch
+    # for s in range(shape[1]+1):
+    #     if PROCESS_RANK ==0:
+    #         print('Processing time_step: ' + str(i) + '/' +str(shape[1]+1))
+
+    # For the moment we work with no-time_stepping and shift = 0
+    s = 0
+
+    # Initialize output matrices
+    TRUE = np.zeros((samp_per_gpu, shape[1], shape[0], 2))
+    PREDS = np.zeros((samp_per_gpu, shape[1], shape[0]))
+    EQ_PAR = np.zeros((samp_per_gpu,3))
+
+
+    test_set = HDF5Dataset(test_indici, 
+                                   shape[0], 
+                                   shape[1], 
+                                   shape[2],
+                                   dshift = s,
+                                   database_path=db_name+".hdf5"
+                                   )
+
+    if distributed:
+
+        test_sampler = DistributedEvalSampler(test_set, num_replicas=WORLD_SIZE,
+                                                          rank=PROCESS_RANK)
+
+        test_loader = torch.utils.data.DataLoader(test_set, **params, sampler=test_sampler)
+
+    else:
+
+        test_loader = torch.utils.data.DataLoader(test_set, **params)
+
+
+    # Start predictions
+    with torch.no_grad():
+
+        # for j, (data, y, Mw,ava_stat, NOISE0, STF, index) in enumerate(test_loader):
+        for j, (data_n, data , _, eq_par) in enumerate(test_loader):
+
+            start = j*batch_size_per_gpu
+            end = start + batch_size_per_gpu
+
+            print ("j: {} -- Start {} - end: {}".format(j,start,end))
+
+
+            # Load data and labels on GPU
+            # data = data.to(gpu, non_blocking=True)
+            data_n = data_n.to(gpu, non_blocking=True)
+
+            recon_batch, mu, logvar = Dmodel(data_n.double())
+
+            label = data.cpu().numpy()
+            input_data = data_n.cpu()
+            pred = recon_batch.cpu().numpy()
+
+            # Rescale predictions
+            scale = 1e-8
+            recon_batch -= 1.0
+            recon_batch *= scale
+
+
+            TRUE[start:end,:,:,0] = label[:,0,:,:] # Label
+            TRUE[start:end,:,:,1] = input_data[:,0,:,:] # Input data
+            PREDS[start:end,:,:] = pred[:,0,:,:] #save reconstruction
+            EQ_PAR[start:end, :] = eq_par[:,:3] # Save Mw lat and lon
+
+
+
+
+    np.save(modelname+'_EQ_PAR_test_rank{}.npy'.format(PROCESS_RANK),EQ_PAR) 
+    np.save(modelname+'_PREDS_test_rank{}.npy'.format(PROCESS_RANK),PREDS)
+    np.save(modelname+'_TRUE_test_rank{}.npy'.format(PROCESS_RANK),TRUE)
+
+
+
+def main(PROCESS_RANK, WORLD_SIZE, args):
+
+    print("Running PEGSNET_DVAE (DDP) on rank {}.".format(PROCESS_RANK))
+
+    if PROCESS_RANK==0:
+        print("ME, PROCESS {}, I am MASTER".format(PROCESS_RANK))
+
+    # Check which is the platform
+    platform = args.platform
+    # Set up distributed flag
+    if platform == 'laptop':
+        distributed = False
+        LOCAL_RANK = 0
+
+    elif platform == 'hotshot':
+        distributed = True
+        setup(PROCESS_RANK,WORLD_SIZE)
+        LOCAL_RANK = PROCESS_RANK
+
+    elif platform == 'JZ':
+        distributed = True
+        setup(PROCESS_RANK,WORLD_SIZE)
+        LOCAL_RANK = idr_torch.local_rank
+
+
+    set_backend('agg')  # for matplotlib Theo
+    
 
     # Setting up the parameters
     # Dabatabse name with data
@@ -166,7 +355,7 @@ def main(args):
     tot_samp = train_nsamp + val_nsamp + test_nsamp
     # Total batch size. This is divided by the number of GPUs
     batch_size = args.batch_size
-    batch_size_per_gpu = batch_size // idr_torch.size
+    batch_size_per_gpu = batch_size // WORLD_SIZE
     # Learning rate
     lr = args.lr
     # Number of components to use
@@ -185,6 +374,8 @@ def main(args):
     latent_dim = args.latent_dim
     # Which skip connections to establish
     skip_co = args.skip_co
+    # Model to use for predictions on test set (BEST or LAST)
+    test_mode = args.test_mode
 
 
     #Load index for train/val/test
@@ -193,7 +384,7 @@ def main(args):
     list_val = np.load(working_db +"_val_idx.npy")[:val_nsamp]
     list_test = np.load(working_db +"_test_idx.npy")[:test_nsamp]
 
-    if idr_torch.rank ==  0:
+    if PROCESS_RANK ==  0:
         # Do some checks on dimensions and number of samples as specified in input parameters
         if (train_nsamp > len(list_train)):
             print (" train_nsamp is bigger than the maximum number of training samples for this database which is {}".format(len(list_train)))
@@ -209,14 +400,18 @@ def main(args):
             sys.exit("Exit")
 
     ################### CREATE OUTPUT DIRECTORY #########################################
-    modeldir = "./outputs/model_"+ modelprefix
+    modeldir = "./outputs/model_" + modelprefix
+    plotsdir = "./outputs/model_" + modelprefix + "/plots"
 
 
     modelname = modeldir + "/model_" + modelprefix + '_' + str(int(train_nsamp/1000)) + "k" + str(int(val_nsamp/1000)) + "k"
+    plotsname = plotsdir + "/model_" + modelprefix + '_' + str(int(train_nsamp/1000)) + "k" + str(int(val_nsamp/1000)) + "k"
 
-    if idr_torch.rank ==0:
+    if PROCESS_RANK ==0:
         if not os.path.exists(modeldir):
             os.makedirs(modeldir)
+        if not os.path.exists(plotsdir):
+            os.makedirs(plotsdir)
 
     # LOAD ACTIVE stations index and sort lon/lat 
     # USELESS now. The database has active stations already sorted
@@ -246,18 +441,23 @@ def main(args):
 
 
     #################  CREATE MODEL ################
-    # Set the device
-    torch.cuda.set_device(idr_torch.local_rank)
-    gpu = torch.device("cuda")
-    # Create the model
-    # model0 = DVAE(n_comp, latent_dim).to(gpu)
-    model0 = DVAE_WSC(n_comp, latent_dim, skips=skip_co).to(gpu)
-    model0 = model0.double()
-    # Wrap the model in a DDP object
-    Dmodel = DDP(model0,device_ids=[idr_torch.local_rank])
+    if distributed:
+        # Set the device
+        torch.cuda.set_device(LOCAL_RANK)
+        gpu = torch.device("cuda")
+        # Create the model
+        model0 = DVAE_WSC(n_comp, latent_dim, skips = skip_co).to(gpu)
+        model0 = model0.double()
+        # Wrap the model in a DDP object
+        Dmodel = DDP(model0,device_ids=[LOCAL_RANK])
+    else:
+        gpu = torch.device("cuda")
+        # Create the model
+        model0 = DVAE_WSC(n_comp, latent_dim, skips = skip_co).to(gpu)
+        Dmodel = model0.double().to(gpu)
+        
     # Define the optimizer
     optimizer = optim.Adam(Dmodel.parameters(), lr=lr)
-    # optimizer = optim.SGD(Dmodel.parameters(), lr=lr, momentum=0.9, nesterov=True) # would need to add args in parser
 
 
 # IF RESUME load stuff and update epochs
@@ -267,12 +467,18 @@ def main(args):
         CPATH = resume_chkp
         print ("")
         print(" Resuming training from {}".format(CPATH))
-        #Synchronize on all gpus
-        dist.barrier()
-        # By default the model is load to CPU. We need to remap to each GPU
-        map_location = {'cuda:%d' % 0: 'cuda:%d' % idr_torch.local_rank} # remap storage from GPU 0 to local GPU 
-        # Now load it
-        checkpoint = torch.load(CPATH, map_location=map_location)
+        
+        if distributed:
+            #Synchronize on all gpus
+            dist.barrier()
+            # By default the model is load to CPU. We need to remap to each GPU
+            map_location = {'cuda:%d' % 0: 'cuda:%d' % LOCAL_RANK} # remap storage from GPU 0 to local GPU 
+            # Now load it
+            checkpoint = torch.load(CPATH, map_location=map_location)
+            
+        else:
+            checkpoint = torch.load(CPATH, map_location=map_location)
+            
         Dmodel.load_state_dict(checkpoint['model_state_dict']) # load checkpoint
         # Redefine stuff on CPU
         checkpoint = torch.load(CPATH)
@@ -284,69 +490,92 @@ def main(args):
 #########################################################################
 #############  SPECIFY training parameters and data loaders #############
     # Parameters
-    params = {'batch_size': batch_size_per_gpu,
-              'shuffle': False,
-              'num_workers': 40,
-              'pin_memory':True}
-
-
+    if distributed:
+        params = {'batch_size': batch_size_per_gpu,
+                  'shuffle': False,
+                  'num_workers': 40,
+                  'pin_memory':True}
+    else:
+        params = {'batch_size': batch_size_per_gpu,
+          'shuffle': True,
+          'num_workers': 16,
+          'pin_memory':True}
+        
+        
     # Datasets
-
     partition = {
         "train": list_train,
         "validation": list_val,
         "test" : list_test
         }# IDs
 
-#  The generator will load the data     
+
     # Generators
     training_set = HDF5Dataset(partition['train'],
                                n_stations,
                                t_max,
                                n_comp,
+                               dshift = 0,
                                database_path=working_db+".hdf5"
                                )
 
-# Sampler is needed by DistributedDataParallel
-    train_sampler = torch.utils.data.distributed.DistributedSampler(training_set,
-                                                                    num_replicas=idr_torch.size,
-                                                                    rank=idr_torch.rank)
 
-# The loader will load the data using generator and sampler
-    train_loader = torch.utils.data.DataLoader(training_set, **params, sampler=train_sampler)
-
-
-
-
-# Same for validation set. The only thing that changes is the sampler that takes care of uneven batches. 
+    # Same for validation set. The only thing that changes is the sampler that takes care of uneven batches. 
     validation_set = HDF5Dataset(partition['validation'],
                                  n_stations,
                                  t_max,
                                  n_comp,
+                                 dshift=0,
                                  database_path=working_db+".hdf5"
                                  )
 
 
-    val_sampler = DistributedEvalSampler(validation_set, num_replicas=idr_torch.size,
-                                                                    rank=idr_torch.rank)
+    if distributed:
+        #  The generator will load the data     
+
+    # Sampler is needed by DistributedDataParallel
+        train_sampler = torch.utils.data.distributed.DistributedSampler(training_set,
+                                                                        num_replicas=WORLD_SIZE,
+                                                                        rank=PROCESS_RANK)
+
+    # The loader will load the data using generator and sampler
+        train_loader = torch.utils.data.DataLoader(training_set, **params, sampler=train_sampler)
 
 
+        val_sampler = DistributedEvalSampler(validation_set, num_replicas=WORLD_SIZE,
+                                                                        rank=PROCESS_RANK)
 
-    val_loader = torch.utils.data.DataLoader(validation_set, **params, sampler=val_sampler)
 
+        val_loader = torch.utils.data.DataLoader(validation_set, **params, sampler=val_sampler)
+
+    else:
+
+        train_loader = torch.utils.data.DataLoader(training_set, **params)
+        val_loader = torch.utils.data.DataLoader(validation_set, **params)
 
 
 
 ########   START TRAINING LOOP 
     train_losses = []
     val_losses = []
-    if idr_torch.rank == 0: start = datetime.now()
+    
+######## coefficients for loss terms
+    # BCE reconstruction loss
+    alpha = 1   # default = 1
+    # KLD latent loss
+    beta  = 0.1 # default = 1     
+    # SL smooth loss
+    gamma = 0 # without smoothing
+        
+    BCE_train_losses, BCE_val_losses = [],[]
+    KLD_train_losses, KLD_val_losses = [],[]
+    SL_train_losses,  SL_val_losses  = [],[]
+    
+    if PROCESS_RANK == 0: start = datetime.now()
 # This is looping over all epochs
     for epoch in range(epoch_start, max_epochs + 1):
-        if idr_torch.rank == 0:
+        if PROCESS_RANK == 0:
             start_dataload = time()
-        # Set epoch is needed to avoid deterministic sampling 
-        train_sampler.set_epoch(epoch)
 
 ##############   SAVE/LOAD CHECKPOINT 
         if epoch % check_interval == 0:
@@ -354,7 +583,7 @@ def main(args):
             CPATH = modelname + "_CHECK_EPOCH_{}.pth".format(epoch)
 
             # ONLY MASTER SAVES THE CHECKPOINT
-            if idr_torch.rank == 0:
+            if PROCESS_RANK == 0:
                 print ("+++ Saving checkpoint in {} +++".format(CPATH))
                 #torch.save(Pmodel.state_dict(),CPATH)
                 torch.save({
@@ -363,45 +592,59 @@ def main(args):
                             'optimizer_state_dict': optimizer.state_dict(),
                              }, CPATH)
 
-################### NOW LOAD IT EVERYWHERE
-            #Synchronize on all gpus
-            dist.barrier()
-            map_location = {'cuda:%d' % 0: 'cuda:%d' % idr_torch.local_rank} # remap storage from GPU 0 to local GPU 
-            #Pmodel.load_state_dict(torch.load(CPATH, map_location=map_location))
-            checkpoint = torch.load(CPATH, map_location=map_location)
-            Dmodel.load_state_dict(checkpoint['model_state_dict']) # load checkpoint
-            #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            #epoch = checkpoint['epoch']
+            if distributed:
+                # Set epoch is needed to avoid deterministic sampling 
+                train_sampler.set_epoch(epoch)
+    ################### NOW LOAD IT EVERYWHERE
+                #Synchronize on all gpus
+                dist.barrier()
+                map_location = {'cuda:%d' % 0: 'cuda:%d' % LOCAL_RANK} # remap storage from GPU 0 to local GPU 
+                #Pmodel.load_state_dict(torch.load(CPATH, map_location=map_location))
+                checkpoint = torch.load(CPATH, map_location=map_location)
+                Dmodel.load_state_dict(checkpoint['model_state_dict']) # load checkpoint
+                #optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                #epoch = checkpoint['epoch']
+            else:
+                checkpoint = torch.load(CPATH)
+                Dmodel.load_state_dict(checkpoint['model_state_dict']) # load checkpoint            
 
          # Set the model in train mode
         Dmodel.train()
 
-        train_loss = 0.0
-
+        train_loss     = 0.0
+        BCE_train_loss = 0.0
+        KLD_train_loss = 0.0
+        SL_train_loss  = 0.0
+        
         # Start looping over batches for the training dataset
         for batch_idx, (data_n, data , _, _ ) in enumerate(train_loader):
 
-            if idr_torch.rank == 0: stop_dataload = time()
+            if PROCESS_RANK == 0: stop_dataload = time()
 
             # Load data and labels on GPU
             data = data.to(gpu, non_blocking=True)
             data_n = data_n.to(gpu, non_blocking=True)
 
-            if idr_torch.rank == 0: start_training = time()
-
-            # if PROCESS_RANK == 0 or PROCESS_RANK == 1:
-            #     print (f"RANK {PROCESS_RANK} -- EPOCH{epoch} -- BATCH {batch_idx}")
-            #     print (index)
+            if PROCESS_RANK == 0: start_training = time()
 
             optimizer.zero_grad()
 
             # Predict labels using current batch
             recon_batch, mu, logvar = Dmodel(data_n.double())
+            
             # Evaluate the loss for this batch
-            BCE, KLD = loss_function(recon_batch,data.view(-1,n_comp,t_max, n_stations),mu,logvar)
-            loss = BCE + KLD
+            BCE, KLD, SL = loss_function(recon_batch, data.view(-1,n_comp,t_max, n_stations),
+                                         mu, logvar, 
+                                         bceCoeff=alpha, kldCoeff=beta, slCoeff=gamma)
+
+            loss = BCE + KLD + SL
+            
             #Loss is the mean over all examples in this batch. Default behaviour of criterion.
-            train_loss += loss.item()
+            train_loss     += loss.item()
+            BCE_train_loss += BCE.item()
+            KLD_train_loss += KLD.item()
+            SL_train_loss  += SL.item()
+            
 
             # Do backprop
             loss.backward()
@@ -419,102 +662,140 @@ def main(args):
     # len(index), loss.item(), train_loss))
 
 
-            if idr_torch.rank == 0: stop_training = time()
+            if PROCESS_RANK == 0: stop_training = time()
 
             # Print some infos after log_interval steps for this epoch
-            if batch_idx % log_interval == 0 and idr_torch.rank ==  0:
-                print('Train Epoch: {} [{}/{} ({:.0f}%)]\t BCE Loss: {:.6f} KLD Loss: {:.6f}  Time data load: {:.3f}ms, Time training: {:.3f}ms'.format(
-                    epoch, batch_idx * len(data)*idr_torch.size, len(train_loader.dataset),
+            if batch_idx % log_interval == 0 and PROCESS_RANK ==  0:
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\t BCE Loss: {:.6f}  KLD Loss: {:.6f}  SL Loss: {:.6f}  Time data load: {:.3f}ms, Time training: {:.3f}ms'.format(
+                    epoch, batch_idx * len(data)*WORLD_SIZE, len(train_loader.dataset),
                     100. * batch_idx / len(train_loader),
-                    BCE, KLD, (stop_dataload - start_dataload)*1000, (stop_training - start_training)*1000 ))
+                    BCE, KLD, SL, (stop_dataload - start_dataload)*1000, (stop_training - start_training)*1000 ))
                 # print(len(data))
-                if idr_torch.rank == 0: start_dataload = time()
+                if PROCESS_RANK == 0: start_dataload = time()
 
         nbatches = batch_idx+1
         # Save train loss for this epoch
         train_losses.append(train_loss/nbatches)
+        BCE_train_losses.append(BCE_train_loss/nbatches)
+        KLD_train_losses.append(KLD_train_loss/nbatches)
+        SL_train_losses.append(SL_train_loss/nbatches)
 
-        # CHeckpoint interval is not implemented yet.
-        #if  idr_torch.rank==0 and epoch % check_interval:
 
-        #    torch.save(Pmodel.module.state_dict(), modelname +"_CHECK_{}.pth".format(epoch))
-
-        if idr_torch.rank ==  0 or idr_torch.rank==1:
+        if PROCESS_RANK ==  0 or PROCESS_RANK==1:
             print('====> Epoch: {} Average loss: {:.4f} -- nbatches: {}'.format(
                   epoch, train_loss / nbatches, nbatches))
 
 
-        # Once the epoch is over check on the validation set   
-        val_sampler.set_epoch(epoch)
+        if distributed:
+            # Once the epoch is over check on the validation set   
+            val_sampler.set_epoch(epoch)
+            
         # Set model in eval mode but leave dropout active
         Dmodel.eval()
-        # Activate dropout layers
-        #for m in Dmodel.modules():
-        #    if m.__class__.__name__.startswith('Dropout'):
-                # print("switching dropout on " + str(m.__class__.__name__))
-        #        m.train()
-        test_loss = 0
+        
+        test_loss    = 0.0
+        BCE_val_loss = 0.0
+        KLD_val_loss = 0.0
+        SL_val_loss  = 0.0
+        
         # No gradients are computed here.
         with torch.no_grad():
-            if idr_torch.rank ==0: val_start_dataload = time()
+            if PROCESS_RANK ==0: val_start_dataload = time()
 
             # Start looping over batches of the validation set
             for i, (data_n, data, _,_) in enumerate(val_loader):
-                if idr_torch.rank == 0: val_stop_dataload = time()
+                if PROCESS_RANK == 0: val_stop_dataload = time()
 
                 # Load data and labels on GPU
                 data = data.to(gpu, non_blocking=True)
                 data_n = data_n.to(gpu, non_blocking=True)
 
-                if idr_torch.rank == 0: start_testing = time()
+                if PROCESS_RANK == 0: start_testing = time()
                 recon_batch, mu, logvar = Dmodel(data_n.double())
-                tBCE, tKLD = loss_function(recon_batch, data.view(-1,n_comp,t_max, n_stations), mu, logvar)
-                tloss = tBCE + tKLD
-                test_loss += tloss.item()
 
-                if idr_torch.rank == 0: stop_testing = time()
+                tBCE, tKLD, tSL = loss_function(recon_batch, data.view(-1,n_comp,t_max, n_stations),
+                                                mu, logvar,
+                                                bceCoeff=alpha, kldCoeff=beta, slCoeff=gamma)
+
+                tloss = tBCE + tKLD + tSL
+                
+                test_loss    += tloss.item()
+                BCE_val_loss += tBCE.item()
+                KLD_val_loss += tKLD.item()
+                SL_val_loss  += tSL.item()
+
+                if PROCESS_RANK == 0: stop_testing = time()
 
                 # Print some infos on the validation set 
-                if i % log_interval == 0 and idr_torch.rank ==  0:
+                if i % log_interval == 0 and PROCESS_RANK ==  0:
                     print('Test Epoch: {} [{}/{} ({:.0f}%)]\t val loss: {:.6f} Time val data load: {:.3f}ms, Time testing: {:.3f}ms'.format(
-                    epoch, i * len(data)*idr_torch.size, len(val_loader.dataset),
+                    epoch, i * len(data)*WORLD_SIZE, len(val_loader.dataset),
                     100. * i / len(val_loader),
                     tloss.item(), (val_stop_dataload - val_start_dataload)*1000, (stop_testing - start_testing)*1000 ))
 
-                    if idr_torch.rank == 0: val_start_dataload = time()
+                    if PROCESS_RANK == 0: val_start_dataload = time()
 
-                if i == 0 and idr_torch.rank==0:
+                if i == 0 and PROCESS_RANK==0:    # (first batch, rank 0)
                     n = min(data.size(0), 8)
                     comparison = torch.cat([data[:n,0].view(n,1,t_max,n_stations),
                                         data_n[:n,0].view(n,1,t_max,n_stations),
                                       recon_batch[:n,0].view(n,1,t_max,n_stations)])
-                    save_image(comparison.cpu(),
-                         modelname + "_epoch" + str(epoch) + '_recon.png',
-                         nrow=n, normalize=True, scale_each=True, padding=10)
+                    if (epoch%10 == 0 or epoch==1):   # output image every 10 epochs only (and epoch 1)
+                        save_image(comparison.cpu(), 
+                                   plotsname + "_epoch" + str(epoch) + '_recon.png', 
+                                   nrow=n, normalize=True, scale_each=True, padding=10)
+                    
+################### Plot comparison/acc using matplotlib+numpy: ###############################################
+                        n = min(data.size(0),5)
+                        # n_selec = np.arange(0,n,1) # select first n images in dataset
+                        # n_selec = np.random.randint(0,data.size(0),size=n) # select randomly n images in dataset
+                        
+                        input_images  = data_n[:n,0].view(n,1,t_max,n_stations) #(N,C,H,W) 
+                        target_images = data[:n,0].view(n,1,t_max,n_stations)
+                        output_images = recon_batch[:n,0].view(n,1,t_max,n_stations)
+                        
+                        # plot acc_map and comp map (from visuals.py star import)
+                        acc_map  = plot_multi_acc_map(output_images, target_images, clip=1, clip_bad=0.5, # 50% relative error = 0 in accuracy
+                                                      fig_name= plotsname+"_epoch"+str(epoch)+"_accmap", path='')
+                        
+                        comp_map = plot_multi_comp_map(output_images, target_images,
+                                                       fig_name= plotsname+"_epoch"+str(epoch)+"_compmap", path='')
+                        
+                        rm_noise = plot_multi_comp_map(input_images, output_images,
+                                                       fig_name= plotsname+"_epoch"+str(epoch)+"_noisemap",path='')
+
 
 
 
         nbatches = i+1
         test_loss /= nbatches
         val_losses.append(test_loss)
+        
+        BCE_val_losses.append(BCE_val_loss/nbatches)
+        KLD_val_losses.append(KLD_val_loss/nbatches)
+        SL_val_losses.append(SL_val_loss/nbatches)
 
 
 
         if epoch == epoch_start:
             miniloss = test_loss
-        if idr_torch.rank ==  0 and epoch >  epoch_start:
+        if PROCESS_RANK ==  0 and epoch >  epoch_start:
             print('====> Test set loss: {:.4f} -- nbatches {}'.format(test_loss, nbatches))
 
             if test_loss < miniloss:
                 print ('+++ Saving best model because test_loss: {} < miniloss: {} +++'.format(test_loss,miniloss))
                 miniloss = test_loss
 ##############   SAVE/LOAD CHECKPOINT 
-                PATH_BEST = modelname + "_BEST.pth".format(epoch)
-            # ONLY MASTER SAVES THE CHECKPOINT
-                torch.save(Dmodel.module.state_dict(), PATH_BEST)
-
-    # BArrier at the end of each epoch. A waste but I want to be sure the procs are syncrhonized 
-    dist.barrier()
+                PATH_BEST = modelname + "_BEST"
+                if distributed:
+                    # ONLY MASTER SAVES THE CHECKPOINT
+                    torch.save(Dmodel.module.state_dict(), PATH_BEST+".pth")
+                    torch.save(Dmodel.state_dict(), PATH_BEST+"_DDP.pth")
+                else:
+                    torch.save(Dmodel.state_dict(), PATH_BEST)
+    if distributed:
+        # Barrier at the end of each epoch. A waste but I want to be sure the procs are syncrhonized 
+        dist.barrier()
 
 
 
@@ -528,14 +809,24 @@ def main(args):
     # https://discuss.pytorch.org/t/plotting-loss-curve/42632/3
 
     # For the moment save lossess for each rank. These will be averaged later
-    np.savetxt(modelname +  "RANK_{}_train_losses.txt".format(idr_torch.rank), np.array(train_losses))
-    np.savetxt(modelname +  "RANK_{}_val_losses.txt".format(idr_torch.rank), np.array(val_losses))
+    np.savetxt(modelname +  "RANK_{}_train_losses.txt".format(PROCESS_RANK), np.array(train_losses))
+    np.savetxt(modelname +  "RANK_{}_val_losses.txt".format(PROCESS_RANK), np.array(val_losses))
+    
+    BCE_loss = np.array( ['BCE', np.array(BCE_train_losses), np.array(BCE_val_losses) ] )
+    KLD_loss = np.array( ['KLD', np.array(KLD_train_losses), np.array(KLD_val_losses) ] )
+    SL_loss  = np.array( ['SL' , np.array(SL_train_losses),  np.array(SL_val_losses)  ] )
+    all_sublosses = np.array([BCE_loss, KLD_loss, SL_loss])
+    np.save(modelname +  "RANK_{}_all_sublosses.npy".format(PROCESS_RANK),all_sublosses)
 
     # MASTER NODE will save some stuff and copy some files in output folder
-    if idr_torch.rank==0:
+    if PROCESS_RANK==0:
         print(">>> Training complete in: " + str(datetime.now() - start))
-        torch.save(Dmodel.module.state_dict(), modelname +".pth")
-
+        if distributed:
+            torch.save(Dmodel.module.state_dict(), modelname +".pth")
+            torch.save(Dmodel.state_dict(), modelname +"_DDP.pth")
+        else:
+            torch.save(Dmodel.state_dict(), modelname +".pth")
+            
         #Save list of index for test set (any of these have been used in train+val)
         np.savetxt(modelname + "_test_idx.txt", list_test)
         print (modelname  + "_test_idx.txt has been saved in folder " + modeldir)
@@ -547,10 +838,44 @@ def main(args):
         shutil.copy2(st_file, modelname +"_stat_input.txt")
         shutil.copy2("Classes.py", modelname +"_Classes.py")
         shutil.copy2("./run_script.sh", modelname +"_run_script.sh")
+        
+        
+################### PLOT RANK_0 losses ######
+        train_avg_gpu, val_avg_gpu = get_loss_arrays(modelname, path='', gpus = WORLD_SIZE)[:2]
+        plot_loss_vs_epoch(train_avg_gpu, val_avg_gpu, 
+                           fig_name= plotsname+'_gpu_loss_vs_epoch', path='')
+        plot_different_losses(all_sublosses, 
+                              fig_name= plotsname+'_allsublosses_vs_epoch', path='')
+        
+
+    if distributed:
+        # BArrier at the end. Be sure that the files just copied are available to all ranks. 
+        dist.barrier()
+
+    if PROCESS_RANK==0:
+        print("+++++++++++++++++++++++++++++++")
+        print("Making predictions on test set")
+        start_test_set = datetime.now()
+    # Make predictions on test set 
+    predict_test_set(Dmodel, modelname, working_db, (n_stations,t_max,ncomp), test_mode, distributed, WORLD_SIZE, LOCAL_RANK, PROCESS_RANK)
+
+    if distributed:
+        # BArrier at the end. Be sure that the files just copied are available to all ranks. 
+        dist.barrier()
 
 
-    cleanup()
-    
+    if PROCESS_RANK==0:
+        print(">>> Test set completed in: " + str(datetime.now() - start_test_set))
+
+    if distributed:
+        cleanup()
+
+    if PROCESS_RANK==0:
+        print("+++++++++++++++++++++++++++++++")
+        print("Done")    
+
+
+
     
 
 
@@ -564,8 +889,19 @@ if __name__ == "__main__":
  
     
     
-    main(args)
-           
+    if args.platform == 'hotshot':
+        WORLD_SIZE = 8
+        # Spawn mutliprocessing
+        mp.spawn(main,
+                  args=(WORLD_SIZE, args,),
+                  nprocs=WORLD_SIZE,
+                  join=True)
+    else:
+        # Define variables
+        WORLD_SIZE = idr_torch.size
+        RANK = idr_torch.rank
+
+        main(RANK, WORLD_SIZE, args)
 
 
 

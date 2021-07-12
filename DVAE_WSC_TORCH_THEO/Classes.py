@@ -175,22 +175,22 @@ class DVAE_WSC(nn.Module):
         self.h_dim  = 8 
         self.latent_dim = latent_dim
         self.skips = skips # do we do the skips?
-        
+        alphaELU = 0 #ELU=ReLU, maybe 0.001?
         
         self.conv1 = nn.Sequential(
                                     nn.Conv2d(self.n_chan, self.h_dim*2, 3,2,1),
-                                    nn.BatchNorm2d(self.hdim*2), # added batchnorm so output is similar to deconv3 input
-                                    nn.LeakyReLU(0.2)
+                                    nn.BatchNorm2d(self.h_dim*2), # added batchnorm so output is similar to deconv3 input
+                                    nn.ELU(alpha=alphaELU)
                                     )
         self.conv2 = nn.Sequential(
                                     nn.Conv2d(self.h_dim*2,self.h_dim*4, 3,2,1),
                                     nn.BatchNorm2d(self.h_dim*4),
-                                    nn.LeakyReLU(0.2)
+                                    nn.ELU(alpha=alphaELU)
                                     )
         self.conv3 = nn.Sequential(
                                     nn.Conv2d(self.h_dim*4,self.h_dim*8,3,2,1),
                                     nn.BatchNorm2d(self.h_dim*8),
-                                    nn.LeakyReLU(0.2)
+                                    nn.ELU(alpha=alphaELU)
                                     )
         
         
@@ -201,21 +201,21 @@ class DVAE_WSC(nn.Module):
         
         self.dec1 = nn.Sequential(nn.Linear(self.latent_dim, indim),
                                   nn.BatchNorm1d(indim),
-                                  nn.ReLU()
+                                  nn.ELU(alpha=alphaELU)
                                   )
         
         
         self.deconv1 = nn.Sequential(   # will be receiving skip connection of conv3
                                      nn.ConvTranspose2d(self.h_dim*8, self.h_dim*4, 2, 2),
                                      nn.BatchNorm2d(self.h_dim*4),
-                                     nn.ReLU()
+                                     nn.ELU(alpha=alphaELU)
                                      )
         self.deconv2 = nn.Sequential( # will be receiving skip connection of conv2
                                      nn.ConvTranspose2d(self.h_dim*4, self.h_dim*2 ,2, 2),
                                      nn.BatchNorm2d(self.h_dim*2),
-                                     nn.ReLU()
+                                     nn.ELU(alpha=alphaELU)
                                      )
-        self.deconv3 = nn.Sequetial(
+        self.deconv3 = nn.Sequential(
                                     nn.ConvTranspose2d(self.h_dim*2, self.n_chan, 2,2),
                                     nn.Sigmoid()
                                     )
@@ -258,11 +258,11 @@ class DVAE_WSC(nn.Module):
         out = self.prep_deconv(out)
         
         #decoder
-        if bool(self.skips[2]) : out += for_skip1     # output of conv3 is added to input of deconv1
+        if bool(self.skips[2]) : out = out +  for_skip1     # output of conv3 is added to input of deconv1
         out = self.deconv1(out)
-        if bool(self.skips[1]) : out += for_skip2     # output of conv2 is added to input of deconv2
+        if bool(self.skips[1]) : out = out + for_skip2     # output of conv2 is added to input of deconv2
         out = self.deconv2(out)
-        if bool(self.skips[0]) : out += for_skip3     # output of conv1 is added to input of deconv3
+        if bool(self.skips[0]) : out = out + for_skip3     # output of conv1 is added to input of deconv3
         out = self.deconv3(out)
         
         
@@ -270,10 +270,66 @@ class DVAE_WSC(nn.Module):
         return out.view(-1,self.n_chan, self.height,self.width), mu, logvar
 
 
+class Adv_net(nn.Module):
+    "Simple critique network for GAN architecture usage: (Denoising_GAN = DVAE + Adv_net)"
+    ### add function to make sure output is continuous value between 0-1? (label should be between -1 and 1 to help)
+    def __init__(self, n_chan): 
+        super(Adv_net, self).__init__()
+              
+        self.n_chan = n_chan
+        self.height = 320
+        self.width =  72
+        self.h_dim  = 8 
+        alphaELU = 0
+        
+        self.conv1 = nn.Sequential( # 2 conv2d layers
+                                    nn.Conv2d(self.n_chan, self.h_dim*2, 3,2,1),
+                                    nn.BatchNorm2d(self.h_dim*2), 
+                                    nn.ELU(alpha=alphaELU),
+                                    
+                                    nn.Conv2d(self.h_dim*2,self.h_dim*4, 3,2,1),
+                                    nn.BatchNorm2d(self.h_dim*4),
+                                    nn.ELU(alpha=alphaELU)
+                                    )
+        
+        self.conv2 = nn.Sequential( # 2 conv2d layers
+                                    nn.Conv2d(self.h_dim*4,self.h_dim*8,3,2,1),
+                                    nn.BatchNorm2d(self.h_dim*8),
+                                    nn.ELU(alpha=alphaELU),
+                                    
+                                    nn.Conv2d(self.h_dim*8, self.h_dim*16,3,2,1),
+                                    nn.BatchNorm2d(self.h_dim*16),
+                                    nn.Sigmoid()
+                                    )
+        
+        in_dim   = (self.h_dim*16) * (self.height//16)*(self.width//16)
+        out_dim  = 1
+        self.lin = nn.Linear(in_dim, out_dim)
+        self.sig = nn.Sigmoid()
+        
+        # self.conv2bis = nn.Sequential( # 2 conv2d layers + flattening w/ sigmoid
+        #                             nn.Conv2d(self.h_dim*4,self.h_dim*8,3,2,1),
+        #                             nn.BatchNorm2d(self.h_dim*8),
+        #                             nn.ELU(),
+                                    
+        #                             nn.Conv2d(self.h_dim*8, 1 ,3,2,1), # single output
+        #                             nn.Sigmoid()
+        #                             )
+    
+    
+    def forward(self, x):
+    
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.lin(out)
+        out = self.sig(out)
+
+        return out
+
 class HDF5Dataset(torch.utils.data.Dataset):
 
   'Characterizes a dataset for PyTorch'
-  def __init__(self, list_IDs, n_stat, t_max, n_comp,database_path="../DATABASES/run_db13.hdf5"):
+  def __init__(self, list_IDs, n_stat, t_max, n_comp, dshift = None, database_path="../DATABASES/run_db13.hdf5"):
         'Initialization'
         super(HDF5Dataset, self).__init__()
         
@@ -282,6 +338,7 @@ class HDF5Dataset(torch.utils.data.Dataset):
         self.n_comp = n_comp
         self.database_path = database_path
         self.list_IDs = list_IDs
+        self.dshift = dshift
 
   def open_hdf5(self):
         self.file = h5py.File(self.database_path, 'r')
@@ -299,9 +356,12 @@ class HDF5Dataset(torch.utils.data.Dataset):
         # Select sample
         ID = self.list_IDs[index]
         
-        # Get a time shift at random between 0 and tmax
-        shift = np.random.randint(0,self.t_max+1)
-        shift = 0   
+        # Deterministic shift
+        if self.dshift is not None:
+            shift = self.dshift
+
+        else:# Get a time shift at random between 0 and tmax
+            shift = np.random.randint(0,self.t_max+1)
      
         # starting sample
         t1 = 350-shift
@@ -343,20 +403,23 @@ class HDF5Dataset(torch.utils.data.Dataset):
         #     # Set amplitudes to zero after P-wave arrival
         #     X[i, indP[i]:,:] = 0.0 
         #     label[i, indP[i]:,:] = 0.0
-              
-        X = np.nan_to_num(X)
-        label = np.nan_to_num(label)  
+             
+        
+        # Clip and Scale inputs
         scale = 1e-8
-        X = np.clip(X,-1.0*scale, scale)
-        X /= scale
-        X+=1.0
-        label /= scale
-        label+=1.0
-
+        X = np.nan_to_num(X)
+        X = np.clip(X,-1.0*scale,scale)
+        X /= 2*scale
+        X += 0.5 # now X is between 0 and 1
+        
+        # Clip and Scale labels
+        label = np.nan_to_num(label)
+        label = np.clip(label,-1.0*scale,scale) #not necessary but we never know...
+        label /= 2*scale
+        label += 0.5 # now label is between 0 and 1
 
         # Got to swap axes because pytorch has channel first
         X = np.swapaxes(X,-1,0)
-        
         label = np.swapaxes(label,-1,0)
             
             
