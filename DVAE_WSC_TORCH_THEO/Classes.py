@@ -419,13 +419,22 @@ class HDF5Dataset(torch.utils.data.Dataset):
         #     X[i, indP[i]:,:] = 0.0 
         #     label[i, indP[i]:,:] = 0.0
              
-        
+        # Create noise label
+        noise_label = np.nan_to_num(X) - np.nan_to_num(label)
+        noise_label = np.clip(noise_label,-1.0*scale,scale)
+        noise_label /= scale
+        noise_label += 1.0 # now X is between 0 and 2
+        noise_label /= 2.0 # Now noise_label is between 0 and 1
+        # other normalizations: [-1,1] (0cent), [0,1] (05cent), [0,2] (1cent)
+
+         
         # Clip and Scale inputs
         scale = 1e-8
         X = np.nan_to_num(X)
         X = np.clip(X,-1.0*scale,scale)
         X /= scale
         X += 1 # now X is between 0 and 2
+        X /= 2.0 # Now X is between 0 and 1
         # other normalizations: [-1,1] (0cent), [0,1] (05cent), [0,2] (1cent)
         
         # Clip and Scale labels
@@ -437,13 +446,14 @@ class HDF5Dataset(torch.utils.data.Dataset):
         # Got to swap axes because pytorch has channel first
         X = np.swapaxes(X,-1,0)
         label = np.swapaxes(label,-1,0)
-            
+        noise_label = np.swapaxes(noise_label,-1,0)    
             
         # Load data and get label
         x = torch.from_numpy(X)
-        y = torch.from_numpy(label)
+        y = torch.from_numpy(noise_label)
+        lab = torch.from_numpy(label)
         
-        return x, y, pwav, eq_params 
+        return x, y, lab, pwav, eq_params 
     
     
         
