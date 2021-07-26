@@ -277,7 +277,7 @@ def predict_test_set(Dmodel, modelname, db_name, shape, test_mode, distributed, 
     with torch.no_grad():
 
         # for j, (data, y, Mw,ava_stat, NOISE0, STF, index) in enumerate(test_loader):
-        for j, (data_n, data , _, eq_par) in enumerate(test_loader):
+        for j, (data_n, data , lab, _, eq_par) in enumerate(test_loader):
 
             start = j*batch_size_per_gpu
             end = start + batch_size_per_gpu
@@ -294,16 +294,21 @@ def predict_test_set(Dmodel, modelname, db_name, shape, test_mode, distributed, 
             label = data.cpu().numpy()
             input_data = data_n.cpu()
             pred = recon_batch.cpu().numpy()
-
+            
+            # Get denoised results
+            denoised = input_data - pred
+            
+            
             # Rescale predictions
             scale = 1e-8
-            recon_batch -= 1.0
-            recon_batch *= scale
+            denoised -= 1.0
+            denoised *=2
+            denoised *= scale
 
 
             TRUE[start:end,:,:,0] = label[:,0,:,:] # Label
             TRUE[start:end,:,:,1] = input_data[:,0,:,:] # Input data
-            PREDS[start:end,:,:] = pred[:,0,:,:] #save reconstruction
+            PREDS[start:end,:,:] = denoised[:,0,:,:] #save reconstruction
             EQ_PAR[start:end, :] = eq_par[:,:3] # Save Mw lat and lon
 
 
@@ -620,7 +625,7 @@ def main(PROCESS_RANK, WORLD_SIZE, args):
         SL_train_loss  = 0.0
         
         # Start looping over batches for the training dataset
-        for batch_idx, (data_n, data , _, _ ) in enumerate(train_loader):
+        for batch_idx, (data_n, data , lab, _, _ ) in enumerate(train_loader):
 
             if PROCESS_RANK == 0: stop_dataload = time()
 
@@ -707,7 +712,7 @@ def main(PROCESS_RANK, WORLD_SIZE, args):
             if PROCESS_RANK ==0: val_start_dataload = time()
 
             # Start looping over batches of the validation set
-            for i, (data_n, data, _,_) in enumerate(val_loader):
+            for i, (data_n, data,lab, _,_) in enumerate(val_loader):
                 if PROCESS_RANK == 0: val_stop_dataload = time()
 
                 # Load data and labels on GPU
@@ -742,9 +747,14 @@ def main(PROCESS_RANK, WORLD_SIZE, args):
 
                 if i == 0 and PROCESS_RANK==0:    # (first batch, rank 0)
                     n = min(data.size(0), 8)
+                    denoised = data_n[:n] - recon_batch[:n]
+                    print(data_n.size(), denoised.size())
                     comparison = torch.cat([data[:n,0].view(n,1,t_max,n_stations),
-                                        data_n[:n,0].view(n,1,t_max,n_stations),
-                                      recon_batch[:n,0].view(n,1,t_max,n_stations)])
+                                            data_n[:n,0].view(n,1,t_max,n_stations),
+                                            denoised.view(n,1,t_max,n_stations)])
+                    # comparison = torch.cat([data[:n,0].view(n,1,t_max,n_stations),
+                    #                     data_n[:n,0].view(n,1,t_max,n_stations),
+                    #                   recon_batch[:n,0].view(n,1,t_max,n_stations)])
                     if (epoch%10 == 0 or epoch==1):   # output image every 10 epochs only (and epoch 1)
                         save_image(comparison.cpu(), 
                                    plotsname + "_epoch" + str(epoch) + '_recon.png', 

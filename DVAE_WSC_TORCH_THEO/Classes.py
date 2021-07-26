@@ -418,7 +418,8 @@ class HDF5Dataset(torch.utils.data.Dataset):
         #     # Set amplitudes to zero after P-wave arrival
         #     X[i, indP[i]:,:] = 0.0 
         #     label[i, indP[i]:,:] = 0.0
-             
+        
+        scale = 1e-8
         # Create noise label
         noise_label = np.nan_to_num(X) - np.nan_to_num(label)
         noise_label = np.clip(noise_label,-1.0*scale,scale)
@@ -426,16 +427,22 @@ class HDF5Dataset(torch.utils.data.Dataset):
         noise_label += 1.0 # now X is between 0 and 2
         noise_label /= 2.0 # Now noise_label is between 0 and 1
         # other normalizations: [-1,1] (0cent), [0,1] (05cent), [0,2] (1cent)
-
-         
+        
+        
         # Clip and Scale inputs
-        scale = 1e-8
+
         X = np.nan_to_num(X)
         X = np.clip(X,-1.0*scale,scale)
         X /= scale
         X += 1 # now X is between 0 and 2
         X /= 2.0 # Now X is between 0 and 1
         # other normalizations: [-1,1] (0cent), [0,1] (05cent), [0,2] (1cent)
+        
+        
+        
+
+
+        
         
         # Clip and Scale labels
         label = np.nan_to_num(label)
