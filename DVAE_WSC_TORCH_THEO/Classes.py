@@ -430,8 +430,9 @@ class HDF5Dataset(torch.utils.data.Dataset):
         
         # Clip and Scale labels
         label = np.nan_to_num(label)
+        label = np.clip(label,-1.0*scale, 0.0) # Trying to clip between -scale and zero
         label /= scale
-        label += 1 # now label is between 0 and 2
+        label += 1 # now label is between 0 and 1 because of the clipping
         # other normalizations: [-1,1] (0cent), [0,1] (05cent), [0,2] (1cent)
 
         # Got to swap axes because pytorch has channel first
