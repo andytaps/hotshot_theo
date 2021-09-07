@@ -462,6 +462,8 @@ def main(PROCESS_RANK, WORLD_SIZE, args):
     # Define the optimizer
     optimizer = optim.Adam(Dmodel.parameters(), lr=lr)
 
+    # Here set the scheduler
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.6)
 
 # IF RESUME load stuff and update epochs
 
@@ -760,14 +762,14 @@ def main(PROCESS_RANK, WORLD_SIZE, args):
                         output_images = recon_batch[:n,0].view(n,1,t_max,n_stations)
                         
                         # plot acc_map and comp map (from visuals.py star import)
-                        acc_map  = plot_multi_acc_map(output_images, target_images, clip=1, clip_bad=0.5, # 50% relative error = 0 in accuracy
-                                                      fig_name= plotsname+"_epoch"+str(epoch)+"_accmap", path='')
+                        #acc_map  = plot_multi_acc_map(output_images, target_images, clip=1, clip_bad=0.5, # 50% relative error = 0 in accuracy
+                        #                              fig_name= plotsname+"_epoch"+str(epoch)+"_accmap", path='')
                         
                         comp_map = plot_multi_comp_map(output_images, target_images,
                                                        fig_name= plotsname+"_epoch"+str(epoch)+"_compmap", path='')
                         
-                        rm_noise = plot_multi_comp_map(input_images, output_images,
-                                                       fig_name= plotsname+"_epoch"+str(epoch)+"_noisemap",path='')
+                        #rm_noise = plot_multi_comp_map(input_images, output_images,
+                        #                               fig_name= plotsname+"_epoch"+str(epoch)+"_noisemap",path='')
 
 
 
@@ -780,11 +782,12 @@ def main(PROCESS_RANK, WORLD_SIZE, args):
         KLD_val_losses.append(KLD_val_loss/nbatches)
         SL_val_losses.append(SL_val_loss/nbatches)
 
-
+        # AT THE END OF THE EPOCH TAKE A STEP OF THE SCHEDULER
+        scheduler.step()
 
         if epoch == epoch_start:
             miniloss = test_loss
-        if PROCESS_RANK ==  0 and epoch >  epoch_start:
+        if PROCESS_RANK ==  0 and epoch >  epoch_start + 25:
             print('====> Test set loss: {:.4f} -- nbatches {}'.format(test_loss, nbatches))
 
             if test_loss < miniloss:
